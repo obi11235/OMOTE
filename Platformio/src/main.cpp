@@ -15,6 +15,7 @@
 #include <Adafruit_FT6206.h>
 #include "driver/ledc.h"
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 #define ENABLE_WIFI // Comment out to diable connected features
 
@@ -55,6 +56,7 @@
 
 // Battery declares
 int battery_voltage = 0;
+int charger_status = 0;
 int battery_percentage = 100;
 bool battery_ischarging = false;
 
@@ -62,9 +64,12 @@ bool battery_ischarging = false;
 int motion = 0;
 #define SLEEP_TIMEOUT 20000 // time until device enters sleep mode in milliseconds
 #define MOTION_THRESHOLD 50 // motion above threshold keeps device awake
+int sleep_timeout = SLEEP_TIMEOUT;
+int sleep_timeout_index = 0;
 int standbyTimer = SLEEP_TIMEOUT;
 bool wakeupByIMUEnabled = true;
 LIS3DH IMU(I2C_MODE, 0x19); // Default constructor is I2C, addr 0x19.
+int sleep_timeouts[] = {10000,30000,60000,180000, 600000};
 
 // LCD declarations
 TFT_eSPI tft = TFT_eSPI();
@@ -80,12 +85,10 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_color_t bufA[ screenWidth * screenHeight / 10 ];
 static lv_color_t bufB[ screenWidth * screenHeight / 10 ];
 lv_obj_t* objBattPercentage;
+lv_obj_t* objStatus;
 lv_obj_t* objBattIcon;
 LV_IMG_DECLARE(gradientLeft);
 LV_IMG_DECLARE(gradientRight);
-LV_IMG_DECLARE(appleTvIcon);
-LV_IMG_DECLARE(appleDisplayIcon);
-LV_IMG_DECLARE(appleBackIcon);
 LV_IMG_DECLARE(high_brightness);
 LV_IMG_DECLARE(low_brightness);
 LV_IMG_DECLARE(lightbulb);
@@ -107,15 +110,16 @@ byte rowPins[ROWS] = {SW_A, SW_B, SW_C, SW_D, SW_E}; //connect to the row pinout
 byte colPins[COLS] = {SW_1, SW_2, SW_3, SW_4, SW_5}; //connect to the column pinouts of the keypad
 Keypad customKeypad = Keypad( makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS); 
 #define BUTTON_PIN_BITMASK 0b1110110000000000000000000010000000000000 //IO34+IO35+IO37+IO38+IO39(+IO13)
-byte keyMapTechnisat[ROWS][COLS] = {
-  {0x69,0x20,0x11,0x0D,0x56},
-  {0x4F,0x37,0x10,0x57,0x51},
-  {0x6E,0x21,0x6B,0x6D,0x6C},
-  {0x34,0x0C,0x22,0x50,0x55},
-  {'?' ,0x35,0x2F,0x32,0x36}
-};
-byte virtualKeyMapTechnisat[10] = {0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0x0};
+// byte keyMapTechnisat[ROWS][COLS] = {
+//   {0x69,0x20,0x11,0x0D,0x56},
+//   {0x4F,0x37,0x10,0x57,0x51},
+//   {0x6E,0x21,0x6B,0x6D,0x6C},
+//   {0x34,0x0C,0x22,0x50,0x55},
+//   {'?' ,0x35,0x2F,0x32,0x36}
+// };
+char* virtualKeyMapNumberPad[10] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"};
 byte currentDevice = 1; // Current Device to control (allows switching mappings between devices)
+
 
 // IR declarations
 IRsend IrSender(IR_LED, true);
@@ -126,6 +130,8 @@ byte wakeup_reason;
 enum Wakeup_reasons{WAKEUP_BY_RESET, WAKEUP_BY_IMU, WAKEUP_BY_KEYPAD};
 Preferences preferences;
 
+#define MQTT_PREFIX "remote/omote1/"
+#define HOSTNAME "OMOTE1"
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #define MQTT_SERVER "YOUR_MQTT_SERVER_IP"
@@ -133,7 +139,93 @@ lv_obj_t* WifiLabel;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+struct sh_device{
+    char* name;
+    char* device;
+    byte type;
+    byte tab;
+    char* action_a;
+    char* action_b;
+};
+
+// User Config
+#define SETTINGS_TAB 0
+
+#define DEVICE_TYPE_SLIDER 1
+#define DEVICE_TYPE_TOGGLE 2
+#define DEVICE_TYPE_LABEL 3
+#define DEVICE_TYPE_BUTTON 4
+#define DEVICE_TYPE_BUTTON_PAIR 5
+#define DEVICE_TYPE_NUMBERS 6
+#define DEVICE_TYPE_LAYOUT_COLUMN 7
+
+char* tab_names[] = { "Settings", "Media", "Smart Home" };
+
+sh_device devices[] = {
+  // {"New Test Button", "numbers", DEVICE_TYPE_NUMBERS, 1, "", ""},
+  {"", "", DEVICE_TYPE_LAYOUT_COLUMN, 1, "", ""},
+  {"Lights", "", DEVICE_TYPE_LABEL, 1, "", ""},
+  {"Movie Lights", "movie_lights", DEVICE_TYPE_BUTTON, 1, "", ""},
+  {"Normal Lights", "normal_lights", DEVICE_TYPE_BUTTON, 1, "", ""},
+  {"TV", "", DEVICE_TYPE_LABEL, 1, "", ""},
+  {"TV Vivid", "tv_vivid", DEVICE_TYPE_BUTTON, 1, "", ""},
+  {"TV Cinema", "tv_cinema", DEVICE_TYPE_BUTTON, 1, "", ""},
+  {"", "", DEVICE_TYPE_LAYOUT_COLUMN, 2, "", ""},
+  {"Kitchen", "", DEVICE_TYPE_LABEL, 2, "", ""},
+  {"Floor Lamp", "lamp_1", DEVICE_TYPE_SLIDER, 2, "", ""},
+  {"Table Lamp", "lamp_2", DEVICE_TYPE_SLIDER, 2, "", ""},
+  {"Family Room", "", DEVICE_TYPE_LABEL, 2, "", ""},
+  {"Floor Lamp", "lamp_3", DEVICE_TYPE_SLIDER, 2, "", ""},
+  {"Fan", "fan_1", DEVICE_TYPE_TOGGLE, 2, "", ""},
+  {"Another Button", "button_3", DEVICE_TYPE_BUTTON_PAIR, 2, "Vol +", "Vol -"},
+  {"Another Button", "button_4", DEVICE_TYPE_BUTTON, 2, "", ""}
+};
+
 // Helper Functions -----------------------------------------------------------------------------------------------------------------------
+
+#ifdef ENABLE_WIFI
+void mqttConnect(){
+  Serial.println("MQTT Connecting");
+  client.setServer(MQTT_SERVER, 1883); // MQTT initialization
+  client.connect(HOSTNAME); // Connect using a client id
+}
+
+// WiFi status event
+void WiFiEvent(WiFiEvent_t event){
+  Serial.printf("[WiFi-event] event: %d\n", event);
+  if(event == ARDUINO_EVENT_WIFI_STA_GOT_IP){
+    mqttConnect();
+  }
+  // Set status bar icon based on WiFi status
+  if(event == ARDUINO_EVENT_WIFI_STA_GOT_IP || event == ARDUINO_EVENT_WIFI_STA_GOT_IP6){
+    lv_label_set_text(WifiLabel, LV_SYMBOL_WIFI);
+  }
+  else{
+    lv_label_set_text(WifiLabel, "");
+  }
+}
+#endif
+
+void publishMQTT(char* topic, char* payload){
+  char full_topic[100] = MQTT_PREFIX;
+  strcat(full_topic, topic);
+  Serial.println("MQTT Publish");
+  if(client.state() != MQTT_CONNECTED){
+    Serial.println("MQTT ReConnecting");
+    mqttConnect();
+  }
+  Serial.println("MQTT Send");
+  boolean result = client.publish(full_topic, payload);
+  if(!result){
+    Serial.println("MQTT Send Failed");
+    if(client.state() != MQTT_CONNECTED){
+      Serial.println("MQTT ReConnecting");
+      mqttConnect();
+    }
+    Serial.println("MQTT ReSend");
+    client.publish(full_topic, payload);
+  }
+}
 
 // Set the page indicator scroll position relative to the tabview scroll position
 static void store_scroll_value_event_cb(lv_event_t* e){
@@ -154,46 +246,125 @@ static void bl_slider_event_cb(lv_event_t * e){
   backlight_brightness = constrain(lv_slider_get_value(slider), 60, 255);
 }
 
-// Virtual Keypad Event handler
-static void virtualKeypad_event_cb(lv_event_t* e) {
-  lv_obj_t* target = lv_event_get_target(e);
-  lv_obj_t* cont = lv_event_get_current_target(e);
-  if (target == cont) return; // stop if container was clicked
-  Serial.println(virtualKeyMapTechnisat[(int)target->user_data]);
-  // Send IR command based on the button user data  
-  IrSender.sendRC5(IrSender.encodeRC5X(0x00, virtualKeyMapTechnisat[(int)target->user_data]));
-}
-
-// Apple Key Event handler
-static void appleKey_event_cb(lv_event_t* e) {
-  // Send IR command based on the event user data  
-  IrSender.sendSony(50 + (int)e->user_data, 15);
-  Serial.println(50 + (int)e->user_data);
-}
-
 // Wakeup by IMU Switch Event handler
 static void WakeEnableSetting_event_cb(lv_event_t * e){
   wakeupByIMUEnabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
 }
 
+static void WakeTimeout_event_cb(lv_event_t * e){
+  lv_obj_t * drop = lv_event_get_target(e);
+
+  sleep_timeout_index = lv_dropdown_get_selected(drop);
+  sleep_timeout = sleep_timeouts[sleep_timeout_index];
+  if(sleep_timeout < 10000) sleep_timeout = SLEEP_TIMEOUT;
+  standbyTimer = sleep_timeout;
+}
+
+// Virtual Keypad Event handler
+static void virtualKeypad_event_cb(lv_event_t* e) {
+  lv_obj_t* target = lv_event_get_target(e);
+  lv_obj_t* cont = lv_event_get_current_target(e);
+  if (target == cont) return; // stop if container was clicked
+  
+  char payload[100];
+  StaticJsonDocument<200> doc;
+  doc["key"] = virtualKeyMapNumberPad[(int)target->user_data];
+  doc["tab"] = tab_names[currentDevice];
+  serializeJson(doc, payload);
+
+  publishMQTT("numberpad", payload);
+}
+
+// Button Event handler
+void customKeypadEvent(KeypadEvent key){
+  for(int i=0; i<LIST_MAX; i++){ // Handle multiple keys (Not really necessary in this case)
+    if ( customKeypad.key[i].kchar == key ){
+      KeyState state = customKeypad.key[i].kstate;
+      standbyTimer = sleep_timeout; // Reset the sleep timer when a button is pressed
+      if (state == IDLE){ continue; }
+      Serial.println(customKeypad.key[i].kchar);
+
+      char payload[100];
+      StaticJsonDocument<200> doc;
+      char key_str[2];
+      key_str[0] = key;
+      key_str[1] = '\0';
+
+      doc["key"] = key_str;
+      doc["tab"] = tab_names[currentDevice];
+      if(state == PRESSED) doc["action"] = "press";
+      else if(state == HOLD) doc["action"] = "hold";
+      else if(state == RELEASED) doc["action"] = "released";
+      serializeJson(doc, payload);
+
+      publishMQTT("button", payload);
+    }
+  }
+}
+
 // Smart Home Toggle Event handler
 static void smartHomeToggle_event_cb(lv_event_t * e){
-  char payload[8];
-  if(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED)) strcpy(payload,"true");
-  else strcpy(payload,"false");
-  // Publish an MQTT message based on the event user data  
-  if((int)e->user_data == 1) client.publish("bulb1_set", payload);
-  if((int)e->user_data == 2) client.publish("bulb2_set", payload);
+  char action[8];
+  if(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED)) strcpy(action,"true");
+  else strcpy(action,"false");
+  // Publish an MQTT message based on the event user data
+  char payload[100];
+  StaticJsonDocument<200> doc;
+
+  doc["user_data"] = devices[(int)e->user_data].device;
+  doc["action"] = action;
+  doc["tab"] = tab_names[currentDevice];
+  serializeJson(doc, payload);
+
+  publishMQTT("switch", payload);
 }
 
 // Smart Home Toggle Event handler
 static void smartHomeSlider_event_cb(lv_event_t * e){
   lv_obj_t * slider = lv_event_get_target(e);
-  char payload[8];
-  dtostrf(lv_slider_get_value(slider), 1, 2, payload);
+  char value[8];
+  dtostrf(lv_slider_get_value(slider), 1, 2, value);
   // Publish an MQTT message based on the event user data
-  if((int)e->user_data == 1) client.publish("bulb1_setbrightness", payload);
-  if((int)e->user_data == 2) client.publish("bulb2_setbrightness", payload);
+  char payload[100];
+  StaticJsonDocument<200> doc;
+
+  doc["device"] = devices[(int)e->user_data].device;
+  doc["value"] = value;
+  doc["tab"] = tab_names[currentDevice];
+  serializeJson(doc, payload);
+
+  publishMQTT("slider", payload);
+}
+
+static void smartHomeButton_event_cb(lv_event_t * e){
+  // lv_event_get
+  // Publish an MQTT message based on the event user data
+  char payload[100];
+  StaticJsonDocument<200> doc;
+
+  doc["device"] = devices[(int)e->user_data].device;
+  doc["tab"] = tab_names[currentDevice];
+  serializeJson(doc, payload);
+
+  publishMQTT("softButton", payload);
+}
+
+static void smartHomeButtonPair_event_cb(lv_event_t * e){
+  lv_obj_t * button = lv_event_get_target(e);
+  // Publish an MQTT message based on the event user data
+  char payload[200];
+  StaticJsonDocument<200> doc;
+
+  doc["device"] = devices[(int)e->user_data].device;
+  doc["tab"] = tab_names[currentDevice];
+  if((int)button->user_data == 0){
+    doc["action"] = devices[(int)e->user_data].action_a;
+  }else if((int)button->user_data == 1){
+    doc["action"] = devices[(int)e->user_data].action_b;
+  }
+  serializeJson(doc, payload);
+
+  publishMQTT("softButtonPair", payload);
 }
 
 // Display flushing
@@ -218,7 +389,7 @@ void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data){
   bool touched = false;
   if ((touchX > 0) || (touchY > 0)) {
     touched = true;
-    standbyTimer = SLEEP_TIMEOUT; 
+    standbyTimer = sleep_timeout; 
   }
 
   if( !touched ){
@@ -231,12 +402,12 @@ void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data){
     data->point.x = screenWidth - touchX;
     data->point.y = screenHeight - touchY;
 
-    //Serial.print( "touchpoint: x" );
-    //Serial.print( touchX );
-    //Serial.print( " y" );
-    //Serial.println( touchY );
-    //tft.drawFastHLine(0, screenHeight - touchY, screenWidth, TFT_RED);
-    //tft.drawFastVLine(screenWidth - touchX, 0, screenHeight, TFT_RED);
+    // Serial.print( "touchpoint: x" );
+    // Serial.print( touchX );
+    // Serial.print( " y" );
+    // Serial.println( touchY );
+    tft.drawFastHLine(0, screenHeight - touchY, screenWidth, TFT_RED);
+    tft.drawFastVLine(screenWidth - touchX, 0, screenHeight, TFT_RED);
   }
 }
 
@@ -254,7 +425,7 @@ void activityDetection(){
   standbyTimer -= 100;
   if(standbyTimer < 0) standbyTimer = 0;
   // If the motion exceeds the threshold, the standbyTimer is reset
-  if(motion > MOTION_THRESHOLD) standbyTimer = SLEEP_TIMEOUT;
+  if(motion > MOTION_THRESHOLD) standbyTimer = sleep_timeout;
 
   // Store the current acceleration and time 
   accXold = accX;
@@ -320,6 +491,7 @@ void enterSleep(){
   preferences.putBool("wkpByIMU", wakeupByIMUEnabled);
   preferences.putUChar("blBrightness", backlight_brightness);
   preferences.putUChar("currentDevice", currentDevice);
+  preferences.putInt("sleepTimeout", sleep_timeout_index);
   if(!preferences.getBool("alreadySetUp")) preferences.putBool("alreadySetUp", true);
   preferences.end();
 
@@ -376,23 +548,181 @@ void enterSleep(){
   esp_deep_sleep_start();
 }
 
-#ifdef ENABLE_WIFI
-// WiFi status event
-void WiFiEvent(WiFiEvent_t event){
-  //Serial.printf("[WiFi-event] event: %d\n", event);
-  if(event == ARDUINO_EVENT_WIFI_STA_GOT_IP){
-    client.setServer(MQTT_SERVER, 1883); // MQTT initialization
-    client.connect("OMOTE"); // Connect using a client id
+void generateNumberGrid(lv_obj_t* tab, lv_event_cb_t event_cb){
+  // Configure number button grid 
+  static lv_coord_t col_dsc[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST }; // equal x distribution
+  static lv_coord_t row_dsc[] = { 52, 52, 52, 52, LV_GRID_TEMPLATE_LAST }; // manual y distribution to compress the grid a bit
+
+  // Create a container with grid
+  lv_obj_set_style_pad_all(tab, 0, LV_PART_MAIN);
+  lv_obj_t* cont = lv_obj_create(tab);
+  lv_obj_set_style_shadow_width(cont, 0, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(cont, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_border_width(cont, 0, LV_PART_MAIN);
+  lv_obj_set_style_grid_column_dsc_array(cont, col_dsc, 0);
+  lv_obj_set_style_grid_row_dsc_array(cont, row_dsc, 0);
+  lv_obj_set_size(cont, 240, 270);
+  lv_obj_set_layout(cont, LV_LAYOUT_GRID);
+  lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_set_style_radius(cont, 0, LV_PART_MAIN);
+
+  lv_obj_t* buttonLabel;
+  lv_obj_t* obj;
+
+  // Iterate through grid buttons configure them
+  for (int i = 0; i < 12; i++) {
+    uint8_t col = i % 3;
+    uint8_t row = i / 3;
+    // Create the button object
+    if ((row == 3) && ((col == 0) || (col == 2))) continue; // Do not create a complete fourth row, only a 0 button
+    obj = lv_btn_create(cont);
+    lv_obj_set_grid_cell(obj, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
+    lv_obj_set_style_bg_color(obj, color_primary, LV_PART_MAIN);
+    lv_obj_set_style_radius(obj, 14, LV_PART_MAIN);
+    lv_obj_set_style_shadow_color(obj, lv_color_hex(0x404040), LV_PART_MAIN);
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE); // Clicking a button causes a event in its container
+    // Create Labels for each button
+    buttonLabel = lv_label_create(obj);        
+    if(i < 9){
+      lv_label_set_text_fmt(buttonLabel, std::to_string(i+1).c_str(), col, row);
+      lv_obj_set_user_data(obj, (void*)i); // Add user data so we can identify which button caused the container event
+    }
+    else{
+      lv_label_set_text_fmt(buttonLabel, "0", col, row);
+      lv_obj_set_user_data(obj, (void*)9);
+    } 
+    lv_obj_set_style_text_font(buttonLabel, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_center(buttonLabel);
   }
-  // Set status bar icon based on WiFi status
-  if(event == ARDUINO_EVENT_WIFI_STA_GOT_IP || event == ARDUINO_EVENT_WIFI_STA_GOT_IP6){
-    lv_label_set_text(WifiLabel, LV_SYMBOL_WIFI);
-  }
-  else{
-    lv_label_set_text(WifiLabel, "");
-  }
+  // Create a shared event for all button inside container
+  lv_obj_add_event_cb(cont, event_cb, LV_EVENT_CLICKED, NULL);
 }
-#endif
+
+void generateButtonPair(lv_obj_t* tab, char* a_name, char* b_name, int id, lv_event_cb_t event_cb){
+  lv_obj_t* cont = lv_obj_create(tab);
+  // lv_obj_set_style_shadow_width(cont, 0, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(cont, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_border_width(cont, 0, LV_PART_MAIN);
+  lv_obj_set_size(cont, lv_pct(100), 70);
+  lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_ROW);
+  // lv_obj_set_style_radius(cont, 0, LV_PART_MAIN);
+
+  lv_obj_t* buttonLabel;
+  lv_obj_t* obj;
+
+  obj = lv_btn_create(cont);
+  lv_obj_set_style_bg_color(obj, color_primary, LV_PART_MAIN);
+  lv_obj_set_style_radius(obj, 14, LV_PART_MAIN);
+  lv_obj_set_style_shadow_color(obj, lv_color_hex(0x404040), LV_PART_MAIN);
+  lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE); // Clicking a button causes a event in its container
+  lv_obj_set_user_data(obj, (void*)0);
+  lv_obj_add_event_cb(obj, event_cb, LV_EVENT_CLICKED, (void*)id);
+  // Create Labels for each button
+  buttonLabel = lv_label_create(obj);        
+  
+  lv_label_set_text_fmt(buttonLabel, a_name, 0, 1);
+  
+  lv_obj_set_style_text_font(buttonLabel, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_center(buttonLabel);
+
+  obj = lv_btn_create(cont);
+  lv_obj_set_style_bg_color(obj, color_primary, LV_PART_MAIN);
+  lv_obj_set_style_radius(obj, 14, LV_PART_MAIN);
+  lv_obj_set_style_shadow_color(obj, lv_color_hex(0x404040), LV_PART_MAIN);
+  lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE); // Clicking a button causes a event in its container
+  lv_obj_set_user_data(obj, (void*)1);
+  lv_obj_add_event_cb(obj, event_cb, LV_EVENT_CLICKED, (void*)id);
+  // Create Labels for each button
+  buttonLabel = lv_label_create(obj);        
+  
+  lv_label_set_text_fmt(buttonLabel, b_name, 1, 1);
+  
+  lv_obj_set_style_text_font(buttonLabel, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_center(buttonLabel);
+}
+
+void generateSlider(lv_obj_t* tab, char *name, lv_event_cb_t toggle_event_cb, lv_event_cb_t slider_event_cb, int id){
+  lv_obj_t* menuBox = lv_obj_create(tab);
+  lv_obj_set_size(menuBox, lv_pct(100), 79);
+  lv_obj_set_style_bg_color(menuBox, color_primary, LV_PART_MAIN);
+  lv_obj_set_style_border_width(menuBox, 0, LV_PART_MAIN);
+
+  lv_obj_t* bulbIcon = lv_img_create(menuBox);
+  lv_img_set_src(bulbIcon, &lightbulb);
+  lv_obj_set_style_img_recolor(bulbIcon, lv_color_white(), LV_PART_MAIN);
+  lv_obj_set_style_img_recolor_opa(bulbIcon, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_align(bulbIcon, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  lv_obj_t* menuLabel = lv_label_create(menuBox);
+  lv_label_set_text(menuLabel, name);
+  lv_obj_align(menuLabel, LV_ALIGN_TOP_LEFT, 22, 3);
+  lv_obj_t* lightToggleA = lv_switch_create(menuBox);
+  lv_obj_set_size(lightToggleA, 40, 22);
+  lv_obj_align(lightToggleA, LV_ALIGN_TOP_RIGHT, 0, 0);
+  lv_obj_set_style_bg_color(lightToggleA, lv_color_lighten(color_primary, 50), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(lightToggleA, color_primary, LV_PART_INDICATOR);
+  lv_obj_add_event_cb(lightToggleA, toggle_event_cb, LV_EVENT_VALUE_CHANGED, (void*)id);
+
+  lv_obj_t* slider = lv_slider_create(menuBox);
+  lv_slider_set_range(slider, 0, 100);
+  lv_obj_set_style_bg_color(slider, lv_color_lighten(lv_color_black(), 30), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_grad_color(slider, lv_color_lighten(lv_palette_main(LV_PALETTE_AMBER), 180), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_grad_dir(slider, LV_GRAD_DIR_HOR, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);
+  lv_obj_set_style_bg_opa(slider, 255, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(slider, lv_color_lighten(color_primary, 50), LV_PART_MAIN);
+  lv_slider_set_value(slider, 255, LV_ANIM_OFF);
+  lv_obj_set_size(slider, lv_pct(90), 10);
+  lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, 37);
+  lv_obj_add_event_cb(slider, slider_event_cb, LV_EVENT_VALUE_CHANGED, (void*)id);
+}
+
+void generateSwitch(lv_obj_t* tab, char *name, lv_event_cb_t event_cb, int id){
+  lv_obj_t* menuBox = lv_obj_create(tab);
+  lv_obj_set_size(menuBox, lv_pct(100), 50);
+  lv_obj_set_style_bg_color(menuBox, color_primary, LV_PART_MAIN);
+  lv_obj_set_style_border_width(menuBox, 0, LV_PART_MAIN);
+
+  lv_obj_t* bulbIcon = lv_img_create(menuBox);
+  lv_img_set_src(bulbIcon, &lightbulb);
+  lv_obj_set_style_img_recolor(bulbIcon, lv_color_white(), LV_PART_MAIN);
+  lv_obj_set_style_img_recolor_opa(bulbIcon, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_align(bulbIcon, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  lv_obj_t* menuLabel = lv_label_create(menuBox);
+  lv_label_set_text(menuLabel, name);
+  lv_obj_align(menuLabel, LV_ALIGN_TOP_LEFT, 22, 3);
+  lv_obj_t* lightToggleA = lv_switch_create(menuBox);
+  lv_obj_set_size(lightToggleA, 40, 22);
+  lv_obj_align(lightToggleA, LV_ALIGN_TOP_RIGHT, 0, 0);
+  lv_obj_set_style_bg_color(lightToggleA, lv_color_lighten(color_primary, 50), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(lightToggleA, color_primary, LV_PART_INDICATOR);
+  lv_obj_add_event_cb(lightToggleA, event_cb, LV_EVENT_VALUE_CHANGED, (void*)id);
+}
+
+void generateButton(lv_obj_t* tab, char *name, lv_event_cb_t event_cb, int id){
+  lv_obj_t* buttonLabel;
+  lv_obj_t* obj;
+
+  obj = lv_btn_create(tab);
+  lv_obj_set_style_bg_color(obj, color_primary, LV_PART_MAIN);
+  lv_obj_set_style_radius(obj, 14, LV_PART_MAIN);
+  lv_obj_set_style_shadow_color(obj, lv_color_hex(0x404040), LV_PART_MAIN);
+  lv_obj_set_size(obj, lv_pct(90), 50);
+  lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE); // Clicking a button causes a event in its container
+
+  lv_obj_align(obj, LV_FLEX_ALIGN_CENTER, 0, 0);
+
+  // Create Labels for each button
+  buttonLabel = lv_label_create(obj);
+  lv_label_set_text_fmt(buttonLabel, name);
+  lv_obj_set_user_data(obj, (void*)id); // Add user data so we can identify which button caused the container event
+
+  lv_obj_set_style_text_font(buttonLabel, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_center(buttonLabel);
+
+  lv_obj_add_event_cb(obj, event_cb, LV_EVENT_CLICKED, (void*)id);
+}
 
 // Setup ----------------------------------------------------------------------------------------------------------------------------------
 
@@ -424,7 +754,7 @@ void setup() {
   pinMode(SW_E, INPUT);
 
   // Power Pin Definition
-  pinMode(CRG_STAT, INPUT_PULLUP);
+  pinMode(CRG_STAT, INPUT);
   pinMode(ADC_BAT, INPUT);
 
   // IR Pin Definition
@@ -485,6 +815,8 @@ void setup() {
     wakeupByIMUEnabled = preferences.getBool("wkpByIMU");
     backlight_brightness = preferences.getUChar("blBrightness");
     currentDevice = preferences.getUChar("currentDevice");
+    sleep_timeout_index = preferences.getInt("sleepTimeout");
+    sleep_timeout = sleep_timeouts[sleep_timeout_index];
   }  
 
   // Setup TFT 
@@ -506,7 +838,7 @@ void setup() {
   
   // Setup touchscreen
   Wire.begin(SDA, SCL, 400000); // Configure i2c pins and set frequency to 400kHz
-  touch.begin(128); // Initialize touchscreen and set sensitivity threshold
+  touch.begin(255); // Initialize touchscreen and set sensitivity threshold
   
   // Setup LVGL
   lv_init();
@@ -540,107 +872,54 @@ void setup() {
   lv_obj_set_size(tabview, screenWidth, 270); // 270 = screenHeight(320) - panel(30) - statusbar(20)
   lv_obj_align(tabview, LV_ALIGN_TOP_MID, 0, 20);
 
-  // Add 4 tabs (names are irrelevant since the labels are hidden)
-  lv_obj_t* tab1 = lv_tabview_add_tab(tabview, "Settings");
-  lv_obj_t* tab2 = lv_tabview_add_tab(tabview, "Technisat");
-  lv_obj_t* tab3 = lv_tabview_add_tab(tabview, "Apple TV");
-  lv_obj_t* tab4 = lv_tabview_add_tab(tabview, "Smart Home");
+  lv_obj_t* menuLabel;
 
-  // Configure number button grid 
-  static lv_coord_t col_dsc[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST }; // equal x distribution
-  static lv_coord_t row_dsc[] = { 52, 52, 52, 52, LV_GRID_TEMPLATE_LAST }; // manual y distribution to compress the grid a bit
-
-  // Create a container with grid for tab2
-  lv_obj_set_style_pad_all(tab2, 0, LV_PART_MAIN);
-  lv_obj_t* cont = lv_obj_create(tab2);
-  lv_obj_set_style_shadow_width(cont, 0, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(cont, lv_color_black(), LV_PART_MAIN);
-  lv_obj_set_style_border_width(cont, 0, LV_PART_MAIN);
-  lv_obj_set_style_grid_column_dsc_array(cont, col_dsc, 0);
-  lv_obj_set_style_grid_row_dsc_array(cont, row_dsc, 0);
-  lv_obj_set_size(cont, 240, 270);
-  lv_obj_set_layout(cont, LV_LAYOUT_GRID);
-  lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 0);
-  lv_obj_set_style_radius(cont, 0, LV_PART_MAIN);
-
-  lv_obj_t* buttonLabel;
-  lv_obj_t* obj;
-
-  // Iterate through grid buttons configure them
-  for (int i = 0; i < 12; i++) {
-    uint8_t col = i % 3;
-    uint8_t row = i / 3;
-    // Create the button object
-    if ((row == 3) && ((col == 0) || (col == 2))) continue; // Do not create a complete fourth row, only a 0 button
-    obj = lv_btn_create(cont);
-    lv_obj_set_grid_cell(obj, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
-    lv_obj_set_style_bg_color(obj, color_primary, LV_PART_MAIN);
-    lv_obj_set_style_radius(obj, 14, LV_PART_MAIN);
-    lv_obj_set_style_shadow_color(obj, lv_color_hex(0x404040), LV_PART_MAIN);
-    lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE); // Clicking a button causes a event in its container
-    // Create Labels for each button
-    buttonLabel = lv_label_create(obj);        
-    if(i < 9){
-      lv_label_set_text_fmt(buttonLabel, std::to_string(i+1).c_str(), col, row);
-      lv_obj_set_user_data(obj, (void*)i); // Add user data so we can identify which button caused the container event
-    }
-    else{
-      lv_label_set_text_fmt(buttonLabel, "0", col, row);
-      lv_obj_set_user_data(obj, (void*)9);
-    } 
-    lv_obj_set_style_text_font(buttonLabel, &lv_font_montserrat_24, LV_PART_MAIN);
-    lv_obj_center(buttonLabel);
+  int tab_count = sizeof(tab_names)/sizeof(tab_names[0]);
+  lv_obj_t* tabs[tab_count];
+  for(int i = 0; i < tab_count; i++){
+    tabs[i] = lv_tabview_add_tab(tabview, tab_names[i]);
   }
-  // Create a shared event for all button inside container
-  lv_obj_add_event_cb(cont, virtualKeypad_event_cb, LV_EVENT_CLICKED, NULL);
-  
 
-  // Add content to the Apple TV tab (3)
-  // Add a nice apple tv logo
-  lv_obj_t* appleImg = lv_img_create(tab3);
-  lv_img_set_src(appleImg, &appleTvIcon);
-  lv_obj_align(appleImg, LV_ALIGN_CENTER, 0, -60);
-  // create two buttons and add their icons accordingly
-  lv_obj_t* button = lv_btn_create(tab3);
-  lv_obj_align(button, LV_ALIGN_BOTTOM_LEFT, 10, 0);
-  lv_obj_set_size(button, 60, 60);
-  lv_obj_set_style_radius(button, 30, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(button, color_primary, LV_PART_MAIN);
-  lv_obj_add_event_cb(button, appleKey_event_cb, LV_EVENT_CLICKED, (void*)1);
+  int device_count = sizeof(devices)/sizeof(devices[0]);
+  for(int i = 0 ; i < device_count; i++){
+    if( devices[i].type == DEVICE_TYPE_SLIDER){
+      generateSlider(tabs[devices[i].tab], devices[i].name, smartHomeToggle_event_cb, smartHomeSlider_event_cb, i);
+      lv_obj_set_scrollbar_mode(tabs[devices[i].tab], LV_SCROLLBAR_MODE_ACTIVE);
+    }
+    else if( devices[i].type == DEVICE_TYPE_TOGGLE){
+      generateSwitch(tabs[devices[i].tab], devices[i].name, smartHomeToggle_event_cb, i);
+    }
+    else if (devices[i].type == DEVICE_TYPE_LABEL){
+      menuLabel = lv_label_create(tabs[devices[i].tab]);
+      lv_label_set_text(menuLabel, devices[i].name);
+    }
+    else if( devices[i].type == DEVICE_TYPE_BUTTON){
+      generateButton(tabs[devices[i].tab], devices[i].name, smartHomeButton_event_cb, i);
+    }
+    else if( devices[i].type == DEVICE_TYPE_BUTTON_PAIR){
+      generateButtonPair(tabs[devices[i].tab], devices[i].action_a, devices[i].action_b, i, smartHomeButtonPair_event_cb);
+    }
+    else if( devices[i].type == DEVICE_TYPE_NUMBERS){
+      generateNumberGrid(tabs[devices[i].tab], virtualKeypad_event_cb );
+    }
+    else if( devices[i].type == DEVICE_TYPE_LAYOUT_COLUMN){
+      lv_obj_set_layout(tabs[devices[i].tab], LV_LAYOUT_FLEX);
+      lv_obj_set_flex_flow(tabs[devices[i].tab], LV_FLEX_FLOW_COLUMN);
+    }
+  }
 
-  appleImg = lv_img_create(button);
-  lv_img_set_src(appleImg, &appleBackIcon);
-  lv_obj_set_style_img_recolor(appleImg, lv_color_white(), LV_PART_MAIN);
-  lv_obj_set_style_img_recolor_opa(appleImg, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_align(appleImg, LV_ALIGN_CENTER, -3, 0);
-
-  button = lv_btn_create(tab3);
-  lv_obj_align(button, LV_ALIGN_BOTTOM_RIGHT, -10, 0);
-  lv_obj_set_size(button, 60, 60);
-  lv_obj_set_style_radius(button, 30, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(button, color_primary, LV_PART_MAIN);
-  lv_obj_add_event_cb(button, appleKey_event_cb, LV_EVENT_CLICKED, (void*)2);
-
-  appleImg = lv_img_create(button);
-  lv_img_set_src(appleImg, &appleDisplayIcon);
-  lv_obj_set_style_img_recolor(appleImg, lv_color_white(), LV_PART_MAIN);
-  lv_obj_set_style_img_recolor_opa(appleImg, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_align(appleImg, LV_ALIGN_CENTER, 0, 0);
-  
-
-
-
+  // Tab 0
   // Add content to the settings tab
   // With a flex layout, setting groups/boxes will position themselves automatically
-  lv_obj_set_layout(tab1, LV_LAYOUT_FLEX);
-  lv_obj_set_flex_flow(tab1, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_scrollbar_mode(tab1, LV_SCROLLBAR_MODE_ACTIVE);
+  lv_obj_set_layout(tabs[SETTINGS_TAB], LV_LAYOUT_FLEX);
+  lv_obj_set_flex_flow(tabs[SETTINGS_TAB], LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_scrollbar_mode(tabs[SETTINGS_TAB], LV_SCROLLBAR_MODE_ACTIVE);
 
   // Add a label, then a box for the display settings
-  lv_obj_t* menuLabel = lv_label_create(tab1);
+  menuLabel = lv_label_create(tabs[SETTINGS_TAB]);
   lv_label_set_text(menuLabel, "Display");
 
-  lv_obj_t* menuBox = lv_obj_create(tab1);
+  lv_obj_t* menuBox = lv_obj_create(tabs[SETTINGS_TAB]);
   lv_obj_set_size(menuBox, lv_pct(100), 109);
   lv_obj_set_style_bg_color(menuBox, color_primary, LV_PART_MAIN);
   lv_obj_set_style_border_width(menuBox, 0, LV_PART_MAIN);
@@ -682,7 +961,8 @@ void setup() {
   lv_dropdown_set_options(drop, "10s\n"
                                 "30s\n"
                                 "1m\n"
-                                "3m");
+                                "3m\n"
+                                "10m");
   lv_obj_align(drop, LV_ALIGN_TOP_RIGHT, 0, 61);
   lv_obj_set_size(drop, 70, 22);
   //lv_obj_set_style_text_font(drop, &lv_font_montserrat_12, LV_PART_MAIN);
@@ -692,11 +972,13 @@ void setup() {
   lv_obj_set_style_bg_color(lv_dropdown_get_list(drop), color_primary, LV_PART_MAIN);
   lv_obj_set_style_border_width(lv_dropdown_get_list(drop), 1, LV_PART_MAIN);
   lv_obj_set_style_border_color(lv_dropdown_get_list(drop), lv_color_hex(0x505050), LV_PART_MAIN);
+  lv_dropdown_set_selected(drop, sleep_timeout_index);
+  lv_obj_add_event_cb(drop, WakeTimeout_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
   // Add another label, then a settings box for WiFi
-  menuLabel = lv_label_create(tab1);
+  menuLabel = lv_label_create(tabs[SETTINGS_TAB]);
   lv_label_set_text(menuLabel, "Wi-Fi");
-  menuBox = lv_obj_create(tab1);
+  menuBox = lv_obj_create(tabs[SETTINGS_TAB]);
   lv_obj_set_size(menuBox, lv_pct(100), 80);
   lv_obj_set_style_bg_color(menuBox, color_primary, LV_PART_MAIN);
   lv_obj_set_style_border_width(menuBox, 0, LV_PART_MAIN);
@@ -713,105 +995,12 @@ void setup() {
   lv_obj_align(menuLabel, LV_ALIGN_TOP_RIGHT, 0, 32);
 
   // Another setting for the battery
-  menuLabel = lv_label_create(tab1);
+  menuLabel = lv_label_create(tabs[SETTINGS_TAB]);
   lv_label_set_text(menuLabel, "Battery");
-  menuBox = lv_obj_create(tab1);
+  menuBox = lv_obj_create(tabs[SETTINGS_TAB]);
   lv_obj_set_size(menuBox, lv_pct(100), 125);
   lv_obj_set_style_bg_color(menuBox, color_primary, LV_PART_MAIN);
   lv_obj_set_style_border_width(menuBox, 0, LV_PART_MAIN);
-
-  
-
-
-
-  // Add content to the smart home tab (4)
-  lv_obj_set_layout(tab4, LV_LAYOUT_FLEX);
-  lv_obj_set_flex_flow(tab4, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_scrollbar_mode(tab4, LV_SCROLLBAR_MODE_ACTIVE);
-
-  // Add a label, then a box for the light controls
-  menuLabel = lv_label_create(tab4);
-  lv_label_set_text(menuLabel, "Living Room");
-
-  menuBox = lv_obj_create(tab4);
-  lv_obj_set_size(menuBox, lv_pct(100), 79);
-  lv_obj_set_style_bg_color(menuBox, color_primary, LV_PART_MAIN);
-  lv_obj_set_style_border_width(menuBox, 0, LV_PART_MAIN);
-
-  lv_obj_t* bulbIcon = lv_img_create(menuBox);
-  lv_img_set_src(bulbIcon, &lightbulb);
-  lv_obj_set_style_img_recolor(bulbIcon, lv_color_white(), LV_PART_MAIN);
-  lv_obj_set_style_img_recolor_opa(bulbIcon, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_align(bulbIcon, LV_ALIGN_TOP_LEFT, 0, 0);
-
-  menuLabel = lv_label_create(menuBox);
-  lv_label_set_text(menuLabel, "Floor Lamp");
-  lv_obj_align(menuLabel, LV_ALIGN_TOP_LEFT, 22, 3);
-  lv_obj_t* lightToggleA = lv_switch_create(menuBox);
-  lv_obj_set_size(lightToggleA, 40, 22);
-  lv_obj_align(lightToggleA, LV_ALIGN_TOP_RIGHT, 0, 0);
-  lv_obj_set_style_bg_color(lightToggleA, lv_color_lighten(color_primary, 50), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(lightToggleA, color_primary, LV_PART_INDICATOR);
-  lv_obj_add_event_cb(lightToggleA, smartHomeToggle_event_cb, LV_EVENT_VALUE_CHANGED, (void*)1);
-
-  slider = lv_slider_create(menuBox);
-  lv_slider_set_range(slider, 0, 100);
-  lv_obj_set_style_bg_color(slider, lv_color_lighten(lv_color_black(), 30), LV_PART_INDICATOR);
-  lv_obj_set_style_bg_grad_color(slider, lv_color_lighten(lv_palette_main(LV_PALETTE_AMBER), 180), LV_PART_INDICATOR);
-  lv_obj_set_style_bg_grad_dir(slider, LV_GRAD_DIR_HOR, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);
-  lv_obj_set_style_bg_opa(slider, 255, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(slider, lv_color_lighten(color_primary, 50), LV_PART_MAIN);
-  lv_slider_set_value(slider, 255, LV_ANIM_OFF);
-  lv_obj_set_size(slider, lv_pct(90), 10);
-  lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, 37);
-  lv_obj_add_event_cb(slider, smartHomeSlider_event_cb, LV_EVENT_VALUE_CHANGED, (void*)1);
-
-  // Add another menu box for a second appliance
-  menuBox = lv_obj_create(tab4);
-  lv_obj_set_size(menuBox, lv_pct(100), 79);
-  lv_obj_set_style_bg_color(menuBox, color_primary, LV_PART_MAIN);
-  lv_obj_set_style_border_width(menuBox, 0, LV_PART_MAIN);
-
-  bulbIcon = lv_img_create(menuBox);
-  lv_img_set_src(bulbIcon, &lightbulb);
-  lv_obj_set_style_img_recolor(bulbIcon, lv_color_white(), LV_PART_MAIN);
-  lv_obj_set_style_img_recolor_opa(bulbIcon, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_align(bulbIcon, LV_ALIGN_TOP_LEFT, 0, 0);
-
-  menuLabel = lv_label_create(menuBox);
-  lv_label_set_text(menuLabel, "Ceiling Light");
-  lv_obj_align(menuLabel, LV_ALIGN_TOP_LEFT, 22, 3);
-  lv_obj_t* lightToggleB = lv_switch_create(menuBox);
-  lv_obj_set_size(lightToggleB, 40, 22);
-  lv_obj_align(lightToggleB, LV_ALIGN_TOP_RIGHT, 0, 0);
-  lv_obj_set_style_bg_color(lightToggleB, lv_color_lighten(color_primary, 50), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(lightToggleB, color_primary, LV_PART_INDICATOR);
-  lv_obj_add_event_cb(lightToggleB, smartHomeToggle_event_cb, LV_EVENT_VALUE_CHANGED, (void*)2);
-
-  slider = lv_slider_create(menuBox);
-  lv_slider_set_range(slider, 0, 100);
-  lv_obj_set_style_bg_color(slider, lv_color_lighten(lv_color_black(), 30), LV_PART_INDICATOR);
-  lv_obj_set_style_bg_grad_color(slider, lv_color_lighten(lv_palette_main(LV_PALETTE_AMBER), 180), LV_PART_INDICATOR);
-  lv_obj_set_style_bg_grad_dir(slider, LV_GRAD_DIR_HOR, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);
-  lv_obj_set_style_bg_opa(slider, 255, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(slider, lv_color_lighten(color_primary, 50), LV_PART_MAIN);
-  lv_slider_set_value(slider, 255, LV_ANIM_OFF);
-  lv_obj_set_size(slider, lv_pct(90), 10);
-  lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, 37);
-  lv_obj_add_event_cb(slider, smartHomeSlider_event_cb, LV_EVENT_VALUE_CHANGED, (void*)2);
-
-
-  // Add another room (empty for now)
-  menuLabel = lv_label_create(tab4);
-  lv_label_set_text(menuLabel, "Kitchen");
-
-  menuBox = lv_obj_create(tab4);
-  lv_obj_set_size(menuBox, lv_pct(100), 79);
-  lv_obj_set_style_bg_color(menuBox, color_primary, LV_PART_MAIN);
-  lv_obj_set_style_border_width(menuBox, 0, LV_PART_MAIN);
-
 
   // Set current page according to the current Device
   lv_tabview_set_act(tabview, currentDevice, LV_ANIM_OFF); 
@@ -829,42 +1018,19 @@ void setup() {
   lv_obj_set_size(btn, 50, lv_pct(100));
   lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
   lv_obj_set_style_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
+  
   // Create actual (non-clickable) buttons for every tab
-  btn = lv_btn_create(panel);
-  lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_size(btn, 150, lv_pct(100));
-  lv_obj_t* label = lv_label_create(btn);
-  lv_label_set_text_fmt(label, "Settings");
-  lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(btn, color_primary, LV_PART_MAIN);
-
-  btn = lv_btn_create(panel);
-  lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_size(btn, 150, lv_pct(100));
-  label = lv_label_create(btn);
-  lv_label_set_text_fmt(label, "Technisat");
-  lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(btn, color_primary, LV_PART_MAIN);
-
-  btn = lv_btn_create(panel);
-  lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_size(btn, 150, lv_pct(100));
-  label = lv_label_create(btn);
-  lv_label_set_text_fmt(label, "Apple TV");
-  lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(btn, color_primary, LV_PART_MAIN);
-
-  btn = lv_btn_create(panel);
-  lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_size(btn, 150, lv_pct(100));
-  label = lv_label_create(btn);
-  lv_label_set_text_fmt(label, "Smart Home");
-  lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(btn, color_primary, LV_PART_MAIN);
+  for(int i = 0; i < tab_count; i++){
+    btn = lv_btn_create(panel);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(btn, 150, lv_pct(100));
+    lv_obj_t* label = lv_label_create(btn);
+    lv_label_set_text_fmt(label, tab_names[i]);
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, color_primary, LV_PART_MAIN);
+  }
+  
   // This small hidden button enables the page indicator to scroll further
   btn = lv_btn_create(panel);
   lv_obj_set_size(btn, 50, lv_pct(100));
@@ -909,14 +1075,15 @@ void setup() {
   lv_obj_align(WifiLabel, LV_ALIGN_LEFT_MID, -8, 0);
   lv_obj_set_style_text_font(WifiLabel, &lv_font_montserrat_12, LV_PART_MAIN);
 
-
-
-  
-
   objBattPercentage = lv_label_create(statusbar);
   lv_label_set_text(objBattPercentage, "");
   lv_obj_align(objBattPercentage, LV_ALIGN_RIGHT_MID, -16, 0);
   lv_obj_set_style_text_font(objBattPercentage, &lv_font_montserrat_12, LV_PART_MAIN);
+
+  objStatus = lv_label_create(statusbar);
+  lv_label_set_text(objStatus, "");
+  lv_obj_align(objStatus, LV_ALIGN_LEFT_MID, 14, 0);
+  lv_obj_set_style_text_font(objStatus, &lv_font_montserrat_12, LV_PART_MAIN);
 
   objBattIcon = lv_label_create(statusbar);
   lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_EMPTY);
@@ -928,7 +1095,7 @@ void setup() {
 
   #ifdef ENABLE_WIFI
   // Setup WiFi
-  WiFi.setHostname("OMOTE"); //define hostname
+  WiFi.setHostname(HOSTNAME); //define hostname
   WiFi.onEvent(WiFiEvent);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setSleep(true);
@@ -954,6 +1121,10 @@ void setup() {
 
   lv_timer_handler(); // Run the LVGL UI once before the loop takes over
 
+  // Setup Keypad
+  customKeypad.addEventListener(customKeypadEvent);
+
+  // indev_drv.read_cb = my_touchpad_read;
 
   Serial.print("Setup finised in ");
   Serial.print(millis());
@@ -992,52 +1163,70 @@ void loop() {
     IMUTaskTimer = millis();
   }
 
+  int mqtt_state = -100;
   // Update battery stats at 1Hz
   static unsigned long batteryTaskTimer = millis() + 1000; // add 1s to start immediately
   if(millis() - batteryTaskTimer >= 1000){
+
+      
+    #ifdef ENABLE_WIFI
+    mqtt_state = client.state();
+    if(mqtt_state < 0){
+      mqttConnect();
+    }
+    #endif
+
+
+
     battery_voltage = analogRead(ADC_BAT)*2*3300/4095 + 350; // 350mV ADC offset
+    
+    charger_status = 0;
+    if(digitalRead(CRG_STAT) == 1){
+      charger_status = 1;
+    }
+
     battery_percentage = constrain(map(battery_voltage, 3700, 4200, 0, 100), 0, 100);
     batteryTaskTimer = millis();
-    battery_ischarging = !digitalRead(CRG_STAT);
-    // Check if battery is charging, fully charged or disconnected
-    if(battery_ischarging || (!battery_ischarging && battery_voltage > 4350)){
-      lv_label_set_text(objBattPercentage, "");
-      lv_label_set_text(objBattIcon, LV_SYMBOL_USB);
-    }
-    else{
-      // Update status bar battery indicator
-      //lv_label_set_text_fmt(objBattPercentage, "%d%%", battery_percentage);
-      if(battery_percentage > 95) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_FULL);
-      else if(battery_percentage > 75) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_3);
-      else if(battery_percentage > 50) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_2);
-      else if(battery_percentage > 25) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_1);
-      else lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_EMPTY);
-    }
+    
+    lv_label_set_text_fmt(objBattPercentage, "mqtt state %d   %dV %d %d%%", mqtt_state, battery_voltage, charger_status, battery_percentage);
+
+    lv_label_set_text_fmt(objStatus, "%d", standbyTimer/1000);
+    
+    if(battery_percentage > 95) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_FULL);
+    else if(battery_percentage > 75) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_3);
+    else if(battery_percentage > 50) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_2);
+    else if(battery_percentage > 25) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_1);
+    else lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_EMPTY);
+
+    // battery_ischarging = !digitalRead(CRG_STAT);
+    // // Check if battery is charging, fully charged or disconnected
+    // if(battery_ischarging){
+    //   // lv_label_set_text(objBattPercentage, "charging");
+    //   lv_label_set_text_fmt(objBattPercentage, "%d%V charging", battery_voltage);
+    //   lv_label_set_text(objBattIcon, LV_SYMBOL_USB);
+    // }else if(!battery_ischarging && battery_voltage > 4350){
+    //   lv_label_set_text_fmt(objBattPercentage, "%d%V", battery_voltage);
+    //   lv_label_set_text(objBattIcon, LV_SYMBOL_USB);
+    // }
+    // else{
+    //   // Update status bar battery indicator
+    //   lv_label_set_text_fmt(objBattPercentage, "%d%% not charging", battery_percentage);
+    //   if(battery_percentage > 95) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_FULL);
+    //   else if(battery_percentage > 75) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_3);
+    //   else if(battery_percentage > 50) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_2);
+    //   else if(battery_percentage > 25) lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_1);
+    //   else lv_label_set_text(objBattIcon, LV_SYMBOL_BATTERY_EMPTY);
+    // }
   }
 
   // Keypad Handling
-  customKeypad.getKey(); // Populate key list
-  for(int i=0; i<LIST_MAX; i++){ // Handle multiple keys (Not really necessary in this case)
-    if(customKeypad.key[i].kstate == PRESSED || customKeypad.key[i].kstate == HOLD){
-      standbyTimer = SLEEP_TIMEOUT; // Reset the sleep timer when a button is pressed
-      int keyCode = customKeypad.key[i].kcode;
-      Serial.println(customKeypad.key[i].kchar);
-      // Send IR codes depending on the current device (tabview page)
-      if(currentDevice == 1) IrSender.sendRC5(IrSender.encodeRC5X(0x00, keyMapTechnisat[keyCode/ROWS][keyCode%ROWS]));
-      else if(currentDevice == 2) IrSender.sendSony((keyCode/ROWS)*(keyCode%ROWS), 15);
-    }
-  }
+  customKeypad.getKey(); // Populate key list, triggers call back
 
   // IR Test
-  //tft.drawString("IR Command: ", 10, 90, 1);
-  //decode_results results;
-  //if (IrReceiver.decode(&results)) {
-  //  //tft.drawString(String(results.command) + "        ", 80, 90, 1);
+  // tft.drawString("IR Command: ", 10, 90, 1);
+  // decode_results results;
+  // if (IrReceiver.decode(&results)) {
+  //  tft.drawString(String(results.command) + "        ", 80, 90, 1);
   //  IrReceiver.resume(); // Enable receiving of the next value
-  //}
-
-  
-  
-
-
+  // }
 }
